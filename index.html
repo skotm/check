@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>リアルタイム潮位ビューア</title>
+  <style>
+    :root { color-scheme: light dark; --accent:#0077b6; --bg:#f6f8fb; --card:#fff; --text:#17202a; --muted:#667085; --grid:#d0d7de; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#0f1720; --card:#17212b; --text:#f2f4f7; --muted:#a9b4c0; --grid:#344150; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 28px clamp(16px, 4vw, 48px); background: linear-gradient(135deg, #006d9c, #00a6d6); color: white; }
+    h1 { margin: 0 0 8px; font-size: clamp(1.5rem, 3vw, 2.5rem); }
+    main { padding: 24px clamp(16px, 4vw, 48px); display: grid; gap: 18px; }
+    .card { background: var(--card); border: 1px solid color-mix(in srgb, var(--grid), transparent 35%); border-radius: 18px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.08); }
+    .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; align-items: end; }
+    label { display: grid; gap: 6px; font-weight: 700; }
+    select, input, button { width: 100%; border: 1px solid var(--grid); border-radius: 10px; padding: 10px 12px; font: inherit; background: var(--card); color: var(--text); }
+    button { cursor: pointer; border: 0; background: var(--accent); color: white; font-weight: 700; }
+    button.secondary { background: #475467; }
+    .status { color: var(--muted); line-height: 1.7; }
+    .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+    .metric { padding: 14px; border-radius: 14px; background: color-mix(in srgb, var(--accent), transparent 88%); }
+    .metric b { display:block; font-size: 1.8rem; margin-top: 4px; }
+    .chart-wrap { overflow-x: auto; }
+    svg { min-width: 680px; width: 100%; height: 360px; display: block; }
+    table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+    th, td { border-bottom: 1px solid var(--grid); padding: 8px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    .error { color: #d92d20; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>リアルタイム潮位ビューア</h1>
+    <p>気象庁の潮位 JSON を定期的に確認し、選択した観測点の最新潮位を表示します。</p>
+  </header>
+  <main>
+    <section class="card controls">
+      <label>観測点
+        <select id="stationSelect"><option>読み込み中...</option></select>
+      </label>
+      <label>更新確認間隔（秒）
+        <input id="intervalInput" type="number" min="30" step="10" value="60" />
+      </label>
+      <button id="refreshButton">今すぐ更新</button>
+      <button id="autoButton" class="secondary">自動更新: ON</button>
+    </section>
+
+    <section class="card">
+      <div id="status" class="status">初期化しています...</div>
+      <div class="metric-grid" aria-live="polite">
+        <div class="metric">観測点<b id="stationName">-</b></div>
+        <div class="metric">最新潮位<b id="latestLevel">-</b></div>
+        <div class="metric">観測時刻<b id="latestObserved">-</b></div>
+        <div class="metric">データ時刻<b id="dataTime">-</b></div>
+      </div>
+    </section>
+
+    <section class="card chart-wrap">
+      <svg id="chart" role="img" aria-label="潮位グラフ"></svg>
+    </section>
+
+    <section class="card">
+      <h2>最新データ</h2>
+      <div style="overflow-x:auto"><table id="dataTable"></table></div>
+    </section>
+  </main>
+
+<script>
+const API = {
+  areas: 'https://www.jma.go.jp/bosai/tidelevel/const/tide_area.json',
+  time: 'https://www.jma.go.jp/bosai/tidelevel/data/tide/tide_time.json',
+  obs: (date, code) => `https://www.jma.go.jp/bosai/tidelevel/data/tide/tide_obs_${date}_${code}.json`,
+};
+
+const state = { stations: [], timeInfo: null, timer: null, auto: true };
+const $ = (id) => document.getElementById(id);
+
+function setStatus(message, isError = false) {
+  $('status').innerHTML = isError ? `<span class="error">${escapeHtml(message)}</span>` : escapeHtml(message);
+}
+function escapeHtml(value) { return String(value).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+async function fetchJson(url) { const res = await fetch(url, { cache: 'no-store' }); if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${url}`); return res.json(); }
+
+function flattenStations(node, path = []) {
+  if (!node || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node.flatMap((item) => flattenStations(item, path));
+  const code = node.code ?? node.stationCode ?? node.tide_code ?? node.id;
+  const name = node.name ?? node.name_kana ?? node.title ?? node.areaName;
+  const children = ['children', 'items', 'areas', 'stations', 'contents'].flatMap((key) => flattenStations(node[key], name ? [...path, name] : path));
+  const own = code && name ? [{ code: String(code), name: String(name), group: path.join(' / '), raw: node }] : [];
+  return [...own, ...children, ...Object.values(node).flatMap((value) => (typeof value === 'object' ? flattenStations(value, name ? [...path, name] : path) : []))];
+}
+
+function uniqueStations(stations) {
+  const seen = new Map();
+  for (const s of stations) if (!seen.has(s.code)) seen.set(s.code, s);
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+}
+
+function parseDateAndCode(timeInfo, fallbackCode) {
+  const text = JSON.stringify(timeInfo);
+  const date = (text.match(/20\d{6}/) || [new Date().toISOString().slice(0,10).replaceAll('-', '')])[0];
+  const selected = $('stationSelect').value || fallbackCode;
+  const stationMatch = selected && text.includes(selected) ? selected : fallbackCode;
+  return { date, code: stationMatch || selected };
+}
+
+function extractPoints(node, inheritedTime = null, points = []) {
+  if (node == null) return points;
+  if (Array.isArray(node)) {
+    if (node.length >= 2 && (typeof node[0] === 'string' || typeof node[0] === 'number') && typeof node[1] === 'number') {
+      points.push({ time: normalizeTime(node[0]), level: node[1] });
+      return points;
+    }
+    node.forEach((item) => extractPoints(item, inheritedTime, points));
+    return points;
+  }
+  if (typeof node === 'object') {
+    const time = normalizeTime(node.time ?? node.datetime ?? node.dateTime ?? node.observed_at ?? node[0]) || inheritedTime;
+    const level = firstNumber(node.level, node.tideLevel, node.tide_level, node.value, node.val, node.obs, node[1]);
+    if (time && Number.isFinite(level)) points.push({ time, level });
+    Object.values(node).forEach((value) => extractPoints(value, time, points));
+  }
+  return points;
+}
+function firstNumber(...values) { for (const value of values) { const n = Number(value); if (Number.isFinite(n)) return n; } return NaN; }
+function normalizeTime(value) {
+  if (value == null) return null;
+  const s = String(value);
+  if (/^\d{14}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(8,10)}:${s.slice(10,12)}:${s.slice(12,14)}`;
+  if (/^\d{12}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(8,10)}:${s.slice(10,12)}:00`;
+  if (/^\d{8}_?\d{6}$/.test(s)) return normalizeTime(s.replace('_', ''));
+  return s;
+}
+function fmtTime(value) { const d = new Date(value); return Number.isNaN(d.getTime()) ? value : d.toLocaleString('ja-JP'); }
+
+async function loadStations() {
+  const data = await fetchJson(API.areas);
+  state.stations = uniqueStations(flattenStations(data));
+  $('stationSelect').innerHTML = state.stations.map((s) => `<option value="${escapeHtml(s.code)}">${escapeHtml(s.group ? `${s.group} / ${s.name}` : s.name)} (${escapeHtml(s.code)})</option>`).join('');
+}
+async function refresh() {
+  try {
+    setStatus('更新時刻を確認しています...');
+    state.timeInfo = await fetchJson(API.time);
+    const { date, code } = parseDateAndCode(state.timeInfo, state.stations[0]?.code);
+    const url = API.obs(date, code);
+    setStatus(`潮位データを取得しています: ${url}`);
+    const obs = await fetchJson(url);
+    const points = extractPoints(obs).filter((p) => Number.isFinite(p.level)).sort((a,b) => new Date(a.time) - new Date(b.time));
+    render(points, date, code, url);
+  } catch (error) { setStatus(error.message, true); }
+}
+function render(points, date, code, url) {
+  const station = state.stations.find((s) => s.code === code) || { name: code };
+  const latest = points.at(-1);
+  $('stationName').textContent = station.name;
+  $('latestLevel').textContent = latest ? `${latest.level} cm` : '-';
+  $('latestObserved').textContent = latest ? fmtTime(latest.time) : '-';
+  $('dataTime').textContent = date;
+  setStatus(`${new Date().toLocaleString('ja-JP')} に更新しました。取得元: ${url}`);
+  drawChart(points.slice(-144));
+  renderTable(points.slice(-20).reverse());
+}
+function drawChart(points) {
+  const svg = $('chart'), w = 900, h = 340, p = 46; svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  if (!points.length) { svg.innerHTML = '<text x="40" y="80">表示できる潮位データがありません</text>'; return; }
+  const min = Math.min(...points.map(p => p.level)), max = Math.max(...points.map(p => p.level));
+  const x = (i) => p + (i / Math.max(1, points.length - 1)) * (w - p * 1.5);
+  const y = (v) => h - p - ((v - min) / Math.max(1, max - min)) * (h - p * 1.6);
+  const line = points.map((pt, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(pt.level).toFixed(1)}`).join(' ');
+  svg.innerHTML = `<line x1="${p}" y1="${p/2}" x2="${p}" y2="${h-p}" stroke="var(--grid)"/><line x1="${p}" y1="${h-p}" x2="${w-p/2}" y2="${h-p}" stroke="var(--grid)"/><text x="8" y="${y(max)+4}">${max}cm</text><text x="8" y="${y(min)+4}">${min}cm</text><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="3"/><circle cx="${x(points.length-1)}" cy="${y(points.at(-1).level)}" r="5" fill="var(--accent)"/>`;
+}
+function renderTable(points) {
+  $('dataTable').innerHTML = '<thead><tr><th>時刻</th><th>潮位</th></tr></thead><tbody>' + points.map((p) => `<tr><td>${escapeHtml(fmtTime(p.time))}</td><td>${p.level} cm</td></tr>`).join('') + '</tbody>';
+}
+function resetTimer() { clearInterval(state.timer); if (state.auto) state.timer = setInterval(refresh, Math.max(30, Number($('intervalInput').value) || 60) * 1000); }
+
+$('refreshButton').addEventListener('click', refresh);
+$('autoButton').addEventListener('click', () => { state.auto = !state.auto; $('autoButton').textContent = `自動更新: ${state.auto ? 'ON' : 'OFF'}`; resetTimer(); });
+$('intervalInput').addEventListener('change', resetTimer);
+$('stationSelect').addEventListener('change', refresh);
+
+loadStations().then(refresh).then(resetTimer).catch((error) => setStatus(error.message, true));
+</script>
+</body>
+</html>
