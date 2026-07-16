@@ -75,6 +75,8 @@ const API = {
 };
 
 const state = { stations: [], timeInfo: null, timer: null, auto: true };
+const HISTORY_DAYS = 5;
+const POINTS_PER_DAY = 48;
 const $ = (id) => document.getElementById(id);
 
 function setStatus(message, isError = false) {
@@ -170,7 +172,7 @@ function render(points, date, code, url) {
   $('latestObserved').textContent = latest ? fmtTime(latest.time) : '-';
   $('dataTime').textContent = date;
   setStatus(`${new Date().toLocaleString('ja-JP')} に更新しました。取得元: ${url}`);
-  drawChart(points.slice(-144));
+  drawChart(points.slice(-(HISTORY_DAYS * POINTS_PER_DAY)));
   renderTable(points.slice(-20).reverse());
 }
 function drawChart(points) {
